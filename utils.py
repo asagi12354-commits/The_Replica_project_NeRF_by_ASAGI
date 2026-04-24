@@ -333,28 +333,55 @@ class NeRFDataset:
 
     # 采样单条数据：返回一批光线+对应像素
     def __getitem__(self, index):
-        # 迭代次数+1，控制中心裁剪策略
+        """
+        数据集的采样函数（PyTorch Dataset 必须实现的方法）
+        作用：根据索引 index 获取一张图片，从中采样光线和对应像素，供 NeRF 训练使用
+        返回：采样后的光线方向、光线起点、真实像素值
+        """
+        # 迭代次数+1，用于控制【中心裁剪策略】的开关
+        # 训练前期只训练图片中心区域，加速模型快速收敛
         self.niter += 1
 
-        # 取出当前图片的所有光线+像素
+        # ===================== 1. 取出当前图片的所有预计算数据 =====================
+        # 从数据集里取出当前 index 对应图片的：所有光线方向
         ray_dirs = self.all_ray_dirs[index]
+        # 从数据集里取出当前 index 对应图片的：所有光线起点（相机原点）
         ray_oris = self.all_ray_origins[index]
+        # 从数据集里取出当前 index 对应图片的：所有真实像素值（RGB）
         img_pixels = self.images[index]
 
-        # 前500轮：只采样中心区域光线，加速收敛
+        # ===================== 2. 前 N 轮：只使用图片中心区域光线 =====================
+        # 训练前期（前 precrop_iters 轮）：只采样图片中心小区域
+        # 目的：让模型先学会拟合中心区域，快速收敛，避免一开始就学习全图导致训练慢/不稳定
         if self.niter < self.precrop_iters:
+            # 只保留中心区域的光线方向
             ray_dirs = ray_dirs[self.precrop_index]
+            # 只保留中心区域的光线起点
             ray_oris = ray_oris[self.precrop_index]
+            # 只保留中心区域对应的真实像素
             img_pixels = img_pixels[self.precrop_index]
 
-        # 随机采样batch_size条光线，不放回采样
+        # ===================== 3. 随机采样固定数量的光线（训练用 batch） =====================
+        # 设置要采样的光线数量 = 训练的 batch_size
         nrays = self.batch_size
+        # 从当前所有有效光线中，【不放回随机采样】nrays 条
+        # ray_dirs.shape[0] = 当前有效光线总数
+        # replace=False：保证每条光线只被选一次，无重复
         select_inds = np.random.choice(ray_dirs.shape[0], size=[nrays], replace=False)
+
+        # 根据随机索引，筛选出最终用于训练的光线方向
         ray_dirs = ray_dirs[select_inds]
+        # 根据随机索引，筛选出最终用于训练的光线起点
         ray_oris = ray_oris[select_inds]
+        # 根据随机索引，筛选出最终用于训练的真实像素
         img_pixels = img_pixels[select_inds]
+
+        # ===================== 4. 返回训练需要的三组数据 =====================
         # 返回：光线方向、光线起点、对应真实像素
+        # NeRF 训练就是用光线去预测像素，然后和真实像素计算损失
         return ray_dirs, ray_oris, img_pixels
+#=========================================================================================================
+
 
     # 生成360°环绕视角的光线：用于渲染旋转视频
     def get_rotate_360_rays(self):
@@ -749,7 +776,14 @@ def train():
 
                 # -------------------- 把渲染结果转成图片并保存 --------------------
                 # 把网络输出的一维像素，恢复成 高×宽×3通道 的图片形状
-                temp_image = (rgb2.view(provider.height, provider.width, 3).cpu().numpy() * 255).astype(np.uint8)
+                # 自动计算正确的宽高，修复 shape 错误
+                H = provider.height
+                W = provider.width
+
+                # 安全 reshape
+                temp_image = rgb2.view(-1, 3)  # [N, 3]
+                temp_image = temp_image[:H * W].view(H, W, 3)
+                temp_image = (temp_image.cpu().numpy() * 255).astype(np.uint8)
                 # OpenCV 用 BGR 格式，网络输出是 RGB，要翻转通道才能保存正确颜色
                 cv2.imwrite(imgpath, temp_image[..., ::-1])
 
